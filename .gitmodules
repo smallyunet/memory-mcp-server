@@ -1,0 +1,6 @@
+[submodule "modelcontextprotocol"]
+	path = modelcontextprotocol
+	url = https://github.com/modelcontextprotocol/modelcontextprotocol.git
+[submodule "python-sdk"]
+	path = python-sdk
+	url = https://github.com/modelcontextprotocol/python-sdk.git
