@@ -1,0 +1,24 @@
+version: "3.9"
+services:
+  memory-mcp:
+    build: ./app
+    container_name: memory-mcp
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - TZ=Asia/Shanghai
+
+  sqlite-web:
+    image: coleifer/sqlite-web:latest
+    container_name: sqlite-web
+    depends_on:
+      - memory-mcp
+    ports:
+      - "8080:8080"
+    # Mount the SQLite database directory read-only for safe viewing
+    volumes:
+      - ./data:/data
+    # Explicitly invoke the sqlite_web executable with args
+    command: ["sqlite_web", "-H", "0.0.0.0", "-p", "8080", "/data/memory.db"]
