@@ -1,23 +1,53 @@
 # User Command Memory MCP Server
 
-A lightweight local server that exposes a REST “Command Memory Layer”, plus a Streamable HTTP MCP interface for fetching recent command context and related analytics.
+A lightweight, local-first server that provides a REST “Command Memory Layer” and a Streamable HTTP MCP interface to persist user commands and derive preferences for AI agents.
 
-- Stores user commands (not AI replies) in a local SQLite database
-- Exposes 4 REST APIs: `/record_command`, `/commands`, `/stats`, `/preferences`
-- Provides MCP resources and tools (see below for full list)
-- Ships with Docker Compose and persists data at `./data/memory.db`
+- Local-first and privacy-friendly: single-user, no auth, data stored in SQLite
+- REST + MCP: easy to integrate with agents and tools
+- Contextual preferences: return task-focused signals based on the current goal
+- Dockerized: one command to run; data persisted at `./data/memory.db`
 
-## Run with Docker Compose
+## Features
+
+- Persist raw user instructions (not assistant output)
+- Retrieve recent command context and full history
+- Heuristic analytics: stats, holistic preferences, and contextual preferences
+- MCP tools for direct agent usage, plus plain REST for fallback
+
+## Quick Start (Docker Compose)
 
 ```bash
 docker compose up --build
 ```
 
-Services:
+Services
 - memory-mcp: MCP + REST on http://localhost:8000
 - sqlite-web: SQLite browser on http://localhost:8080 (reads ./data/memory.db)
 
 Data persists to `./data/memory.db` on the host.
+
+Restart script (rebuild after code changes):
+```bash
+./restart.sh
+```
+
+> Note (Apple Silicon): `sqlite-web` runs as amd64 via emulation and may print a platform warning; this is expected.
+
+## Run Locally (without Docker)
+
+Requirements: Python 3.10+
+
+```bash
+# from the repo root
+python -m venv .venv
+source .venv/bin/activate
+pip install -r app/requirements.txt
+
+# run the server (works best from repo root so data path resolves to ./data)
+python app/mcp_server.py
+```
+
+Server will listen on http://localhost:8000. Data will be stored at `./data/memory.db`.
 
 ## REST API
 
@@ -48,7 +78,7 @@ Example:
 curl -X POST \
 	-H 'Content-Type: application/json' \
 	http://localhost:8000/record_command \
-	-d '{"command_text":"Write unit tests for FastAPI endpoints","tags":["testing","python"]}'
+	-d '{"command_text":"Write unit tests for FastAPI endpoints","tags":["test","python"]}'
 ```
 
 ### 2) List commands
@@ -61,21 +91,21 @@ Response:
 [
 	{
 		"command_text": "Write unit tests for FastAPI endpoints",
-		"tags": ["testing", "python"],
+		"tags": ["test", "python"],
 		"timestamp": "2025-11-08T11:10:00Z"
 	}
 ]
 ```
 
 ```bash
-curl http://localhost:8000/commands
+curl -s http://localhost:8000/commands | jq
 ```
 
 ### 3) Stats
 
 GET /stats
 
-Response (MVP heuristic):
+Response (heuristic):
 
 ```json
 {
@@ -86,40 +116,86 @@ Response (MVP heuristic):
 ```
 
 ```bash
-curl http://localhost:8000/stats
+curl -s http://localhost:8000/stats | jq
 ```
 
-### 4) Preferences
+### 4) Preferences (holistic)
 
 GET /preferences
 
-Response (MVP heuristic):
+Response (heuristic):
 
 ```json
 {
 	"preferred_language": "Python",
-	"common_tasks": ["refactor", "test"],
-	"style": "async, clean"
+	"preferred_language_confidence": 0.8,
+	"common_tasks": ["test", "refactor"],
+	"style": "async, OOP",
+	"frameworks": ["fastapi"],
+	"tools": ["docker", "pytest", "git"],
+	"signals": {
+		"languages": {"python": 8, "javascript": 2},
+		"tasks": {"test": 5, "refactor": 3},
+		"styles": {"async": 3, "oop": 2},
+		"frameworks": {"fastapi": 3},
+		"tools": {"docker": 3, "pytest": 3, "git": 2}
+	}
 }
 ```
 
 ```bash
-curl http://localhost:8000/preferences
+curl -s http://localhost:8000/preferences | jq
+```
+
+### 5) Preferences (contextual)
+
+POST /preferences/contextual
+
+Body:
+
+```json
+{ "context": "Update README and improve docs clarity", "limit": 50 }
+```
+
+Response (task-focused subset):
+
+```json
+{
+	"matched_groups": ["documentation"],
+	"preferred_language": "Python",
+	"style_subset": [],
+	"tasks_subset": ["documentation"],
+	"frameworks_subset": [],
+	"tools_subset": ["git"],
+	"signals_overlap": {
+		"tasks": {"documentation": 3},
+		"styles": {},
+		"tools": {"git": 2}
+	},
+	"context": "Update README and improve docs clarity"
+}
+```
+
+```bash
+curl -s -X POST http://localhost:8000/preferences/contextual \
+	-H 'Content-Type: application/json' \
+	-d '{"context":"Update README and improve docs clarity"}' | jq
 ```
 
 ## MCP interface (optional)
 
-The same process also exposes a Streamable HTTP MCP server at `http://localhost:8000/mcp`.
+This server also exposes a Streamable HTTP MCP endpoint at `http://localhost:8000/mcp`.
 
 ### Tools
 
 | Tool | Args | Description |
 |------|------|-------------|
 | `memory_context` | `token: string (ignored)`, `limit: int=10` | Return recent command context (list of stored raw commands). |
-| `record_command` | `command_text: string`, `tags: list[string]=[]` | Persist a raw user instruction with optional tags. Returns `{"status": "ok"}`. |
+| `record_command` | `command_text: string`, `tags: list[string]=[]` | Persist a raw user instruction with optional tags. |
 | `commands` | *(none)* | List all stored commands (newest first). |
 | `stats` | *(none)* | Basic heuristic statistics across commands. |
-| `preferences` | *(none)* | Heuristic preference analysis inferred from commands. |
+| `preferences` | *(none)* | Holistic heuristic preference analysis (language/tasks/style/frameworks/tools + confidence + raw signals). |
+| `contextual_preferences` | `context: string`, `limit: int=50` | Task-focused subset of preferences filtered by the provided context string. |
 | `help` | *(none)* | Returns this list (for clients that want to introspect). |
 
 ### Resource
@@ -129,15 +205,34 @@ The same process also exposes a Streamable HTTP MCP server at `http://localhost:
 ### Health check
 
 ```bash
-curl http://localhost:8000/healthz
+curl -s http://localhost:8000/healthz | jq
 ```
 
-## Storage
+## Data & Storage
 
 - SQLite file: `./data/memory.db` (mapped to `/app/data/memory.db` in the container)
-- Tables:
-	- `commands` (raw user commands)
+- Table(s):
+	- `commands` — raw user commands with tags and timestamps
 
-## Notes
+## Design Principles
 
-- This is an MVP: analyses are heuristic and lightweight. You can extend with search, weekly digests, embeddings, or a web UI in the future.
+- Local-first: designed to run on your machine by default.
+- Minimal coupling: both MCP tools and plain REST are available.
+- Heuristic, transparent signals: expose raw counts alongside summaries.
+
+## Troubleshooting
+
+- “Instance <...> is not bound to a Session”
+	- The server has been fixed to avoid detached-instance issues; if you see this after updating code, restart the service:
+		```bash
+		./restart.sh
+		```
+- Apple Silicon platform warning for `sqlite-web`
+	- The image runs under amd64 emulation; it’s safe to ignore. You can also replace it with a Python-based container installing `sqlite-web` via pip.
+
+## Next Ideas
+
+- Recency weighting and trend detection
+- Negation handling (e.g., “avoid docker”)
+- Confidence thresholds and insufficient-data flag
+- Relevance scoring beyond keyword overlap

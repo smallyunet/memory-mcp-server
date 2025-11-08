@@ -73,50 +73,190 @@ def compute_stats() -> Dict:
 def analyze_preferences() -> Dict:
     """Heuristic preference analysis from commands.
 
-    - preferred_language: inferred from tags (python, js, go, java, rust etc.)
-    - common_tasks: tags like test, refactor, optimize
-    - style: look for substrings in command_text (async, clean, OOP, functional)
+    Signals considered:
+    - preferred_language: inferred from tags and command_text heuristics
+    - common_tasks: tags/keywords like test, refactor, optimize, deploy, debug
+    - style: keywords like async, clean, OOP, functional, TDD
+    - frameworks/tools (additional, non-breaking fields)
     """
+    # Take a lightweight snapshot of just the fields we need while the session is open
     with database.session_scope() as db:
         rows = db.query(models.Command).all()
-        snap = list(rows)  # snapshot before session closes
+        snap = [
+            {
+                "command_text": (r.command_text or ""),
+                "tags": (r.tags.split(",") if r.tags else []),
+            }
+            for r in rows
+        ]
 
-    # Language inference
-    lang_tags_priority = ["python", "typescript", "javascript", "go", "java", "rust"]
+    # Counters
     tag_counts: Dict[str, int] = {}
-    common_task_markers = ["refactor", "test", "optimize", "document", "deploy"]
     task_counts: Dict[str, int] = {}
-    style_markers = ["async", "clean", "performance", "OOP", "functional"]
-    style_hits: List[str] = []
+    style_counts: Dict[str, int] = {}
+    framework_counts: Dict[str, int] = {}
+    tool_counts: Dict[str, int] = {}
+    language_counts: Dict[str, int] = {}
 
-    for r in snap:
-        tags = r.tags.split(",") if r.tags else []
+    # Heuristic dictionaries
+    lang_markers = {
+        "python": ["python", ".py", "pip", "pytest", "uv ", "conda", "poetry", "ruff", "mypy"],
+        "typescript": ["typescript", "ts ", ".ts", "tsc", "pnpm", "vite", "nextjs", "next.js"],
+        "javascript": ["javascript", "js ", ".js", "npm", "yarn", "node"],
+        "go": ["golang", " go ", ".go", "go build", "go test"],
+        "java": [" java ", ".java", "maven", "mvn ", "gradle"],
+        "rust": ["rust", ".rs", "cargo"],
+        "bash": ["bash", "zsh", ".sh", "shell"],
+    }
+    task_markers = [
+        "refactor", "test", "optimize", "document", "deploy", "debug",
+        "fix", "lint", "typecheck", "benchmark", "profile", "migrate",
+    ]
+    style_markers = ["async", "clean", "performance", "oop", "functional", "tdd", "cli", "script"]
+    framework_markers = [
+        "fastapi", "flask", "django", "react", "nextjs", "vue", "svelte",
+        "spring", "springboot", "express", "nestjs",
+    ]
+    tool_markers = [
+        "docker", "kubernetes", "k8s", "git", "curl", "jq", "pytest", "pip", "conda", "poetry", "uv ",
+        "alembic", "black", "ruff", "flake8", "mypy", "pre-commit", "eslint", "prettier", "jest", "vitest",
+        "playwright", "cypress",
+    ]
+
+    def count_if_present(text: str, markers: List[str], counter: Dict[str, int], key_map: Dict[str, str] | None = None):
+        for m in markers:
+            if m.lower() in text:
+                name = key_map.get(m, m) if key_map else m
+                counter[name] = counter.get(name, 0) + 1
+
+    # Aggregate
+    for item in snap:
+        tags = [t.lower() for t in item["tags"] if t]
+        lower = item["command_text"].lower()
+
+        # Tags as-is
         for t in tags:
-            if not t:
-                continue
             tag_counts[t] = tag_counts.get(t, 0) + 1
-        lower = r.command_text.lower() if r.command_text else ""
-        for marker in common_task_markers:
-            if marker in lower:
-                task_counts[marker] = task_counts.get(marker, 0) + 1
-        for style in style_markers:
-            if style.lower() in lower:
-                style_hits.append(style)
 
+        # Language from tags
+        for lang in lang_markers.keys():
+            if lang in tags:
+                language_counts[lang] = language_counts.get(lang, 0) + 1
+
+        # Language heuristics from text
+        for lang, markers in lang_markers.items():
+            count_before = language_counts.get(lang, 0)
+            count_if_present(lower, markers, language_counts)
+            # reduce accidental double counting if both tag and marker matched strongly
+            if language_counts.get(lang, 0) > count_before:
+                pass
+
+        # Tasks / style / frameworks / tools
+        count_if_present(lower, task_markers, task_counts)
+        count_if_present(lower, style_markers, style_counts)
+        count_if_present(lower, framework_markers, framework_counts)
+        count_if_present(lower, tool_markers, tool_counts)
+
+    # Preferred language selection
     preferred_language = None
-    for lang in lang_tags_priority:
-        if lang in tag_counts:
-            preferred_language = lang.capitalize() if lang == "python" else lang
-            break
+    preferred_language_confidence = None
+    if language_counts:
+        lang_sorted = sorted(language_counts.items(), key=lambda x: x[1], reverse=True)
+        top_lang, top_count = lang_sorted[0]
+        total = sum(language_counts.values())
+        confidence = (top_count / total) if total else 1.0
+        preferred_language = top_lang.capitalize() if top_lang == "python" else top_lang
+        preferred_language_confidence = round(confidence, 3)
 
-    common_tasks = [k.replace("document", "documentation") for k, _ in sorted(task_counts.items(), key=lambda x: x[1], reverse=True)[:5]]
-    style_summary = ", ".join(sorted(set(style_hits))) if style_hits else None
+    # Top tasks and style summary
+    common_tasks = [
+        k.replace("document", "documentation")
+        for k, _ in sorted(task_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+    ]
+    style_summary = ", ".join([k.upper() if k in ("oop", "tdd") else k for k, _ in sorted(style_counts.items(), key=lambda x: x[1], reverse=True)[:5]]) or None
+
+    # Additional informative fields (non-breaking): frameworks and tools
+    frameworks = [k for k, _ in sorted(framework_counts.items(), key=lambda x: x[1], reverse=True)[:5]]
+    tools = [k for k, _ in sorted(tool_counts.items(), key=lambda x: x[1], reverse=True)[:8]]
 
     return {
         "preferred_language": preferred_language,
+        "preferred_language_confidence": preferred_language_confidence,
         "common_tasks": common_tasks,
         "style": style_summary,
+        "frameworks": frameworks,
+        "tools": tools,
+        # Raw signals (optional for transparency; consumers may ignore)
+        "signals": {
+            "languages": language_counts,
+            "tasks": task_counts,
+            "styles": style_counts,
+            "frameworks": framework_counts,
+            "tools": tool_counts,
+        },
     }
+
+
+def analyze_preferences_contextual(context: str, limit: int = 50) -> Dict:
+    """Derive task-focused preferences given a prompt/context string.
+
+    Steps:
+      1. Pull recent commands (up to limit) and reuse core signals logic.
+      2. Score relevance: which stored signals overlap with context words.
+      3. Return only the subset likely useful for this context (e.g. 'update docs' -> doc tools & style).
+
+    This does not train a model; it is heuristic filtering layered on base signals.
+    """
+    base = analyze_preferences()
+    lowered = context.lower()
+
+    # Keyword groups for contextual mapping
+    context_groups = {
+        "documentation": ["doc", "docs", "documentation", "readme", "comment", "write", "update"],
+        "testing": ["test", "pytest", "coverage", "unit", "integration"],
+        "performance": ["perf", "optimize", "benchmark", "profile"],
+        "deployment": ["deploy", "docker", "k8s", "kubernetes", "release"],
+        "refactor": ["refactor", "clean", "restructure"],
+        "debug": ["debug", "trace", "error", "fail"],
+    }
+
+    matched_groups = [g for g, kws in context_groups.items() if any(k in lowered for k in kws)]
+
+    # Filter tasks/styles/tools/frameworks based on matched groups heuristics
+    def filter_list(values: List[str], relevance_words: List[str]) -> List[str]:
+        if not relevance_words:
+            return []
+        lv = lowered
+        return [v for v in values if any(w in lv or w in v for w in relevance_words)]
+
+    relevance_words = []
+    for g in matched_groups:
+        relevance_words.extend(context_groups[g])
+
+    contextual = {
+        "matched_groups": matched_groups,
+        "preferred_language": base.get("preferred_language"),
+        "style_subset": filter_list(base.get("style", "").split(", "), relevance_words),
+        "tasks_subset": filter_list(base.get("common_tasks", []), relevance_words),
+        "frameworks_subset": filter_list(base.get("frameworks", []), relevance_words),
+        "tools_subset": filter_list(base.get("tools", []), relevance_words),
+        "signals_overlap": {
+            "tasks": {k: v for k, v in base.get("signals", {}).get("tasks", {}).items() if k in relevance_words},
+            "styles": {k: v for k, v in base.get("signals", {}).get("styles", {}).items() if k in relevance_words},
+            "tools": {k: v for k, v in base.get("signals", {}).get("tools", {}).items() if k in relevance_words},
+        },
+        "context": context,
+    }
+
+    # Fallback: if no groups matched, surface a minimal neutral preference set
+    if not matched_groups:
+        contextual["tasks_subset"] = base.get("common_tasks", [])[:3]
+        contextual["style_subset"] = base.get("style", "").split(", ") if base.get("style") else []
+        contextual["frameworks_subset"] = base.get("frameworks", [])[:3]
+        contextual["tools_subset"] = base.get("tools", [])[:5]
+        contextual["note"] = "No specific contextual group matched; returned neutral top signals." 
+
+    return contextual
 
 def get_recent_context(limit: int = 5):
     """Return the most recent user commands up to the given limit.

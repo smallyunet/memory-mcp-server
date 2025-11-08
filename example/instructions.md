@@ -5,7 +5,8 @@ Purpose: Persist EVERY actionable user instruction verbatim via a local REST mem
 ## Endpoints (REST)
 - POST /record_command — body: { command_text: string, tags?: string[] }
 - GET /commands — full command history (newest first; client may sort)
-- GET /preferences — inferred language/common_tasks/style
+- GET /preferences — holistic inferred signals (language, tasks, style, frameworks, tools, confidence, raw signals)
+- POST /preferences/contextual — body: { context: string, limit?: number } → task-focused subset of preferences
 - GET /stats — counts, top keywords, active hours
 
 Notes
@@ -13,19 +14,24 @@ Notes
 - This server also exposes MCP tools (see below) for clients that support the Model Context Protocol.
 
 ## Agent Rules (do these exactly)
-1) Session start or unclear context:
-  - Prefer MCP tool preferences() if connected via MCP; otherwise GET /preferences.
-  - If preferences are missing/stale, also list recent history via MCP tool commands() or GET /commands.
-2) After EVERY user message you will act on (instruction, question, correction, even short “ok”):
-  - Immediately persist the EXACT raw user text via MCP tool record_command(command_text, tags?) or POST /record_command.
-  - Preserve spacing, punctuation, emoji, code fences, and newlines; do not paraphrase or translate.
+1) First actionable user turn or when context becomes ambiguous:
+  - Call contextual_preferences(context=<latest user task>) if a concrete task or goal is present (e.g. “update docs”, “add tests”, “deploy container”).
+  - Otherwise call preferences() for holistic baseline. If MCP not available, use REST equivalents.
+  - If returned data is sparse (few signals) also fetch commands() to inspect raw history.
+2) After EVERY user message you act on (instruction, question, correction, even short “ok”):
+  - Persist the EXACT raw user text via record_command(command_text, tags?).
+  - Preserve spacing, punctuation, emoji, code fences, newlines; never paraphrase.
   - Never record assistant output.
-3) Tags (optional, ≤3, lowercase):
-  - Languages: python, javascript (alias: js), typescript (alias: ts), go, java, rust, bash
-  - Intent: refactor, optimize, debug, test, design, doc, deploy, infra
-  - Framework/domain: fastapi, react, spring, ml, cli
-  - If unclear, leave tags empty (do not guess).
-4) Preference alignment: Adapt answers to consistent patterns; refresh /preferences roughly every 25 turns or on obvious drift.
+3) Tag assignment (optional, ≤3, lowercase):
+  - Languages: python, javascript (js), typescript (ts), go, java, rust, bash
+  - Intent: refactor, optimize, debug, test, design, doc, deploy, infra, migrate, profile, benchmark
+  - Framework/domain: fastapi, react, spring, django, flask, ml, cli
+  - If unclear, leave tags empty; do NOT guess.
+4) Preference alignment:
+  - Re-check preferences() roughly every 25 turns or after major shifts.
+  - Use contextual_preferences(context=...) for each new distinct task segment.
+5) Neutral fallback:
+  - If contextual_preferences returns note indicating no groups matched, fall back to top 3 tasks + frameworks/tools from preferences().
 
 ## Data Integrity & Edge Cases
 - Whitespace-only input: skip recording. Otherwise, record verbatim (including multi-line content).
@@ -41,24 +47,40 @@ Errors (REST)
 MCP tool errors are returned as { error: string } in tool result, with similar codes.
 
 ## MCP Tools (for MCP-enabled clients)
-- memory_context(token: string, limit: int=10) → { recent_commands: string[], items: [{ command_text, tags[], timestamp }] }
-  - token is ignored in single-user mode; limit is advisory.
-- record_command(command_text: string, tags: string[] = []) → { status: "ok" } | { error }
-- commands() → list of { command_text, tags[], timestamp } (newest first)
-- stats() → { total_commands, top_keywords: string[], active_hours: string[] }
-- preferences() → { preferred_language: string|null, common_tasks: string[], style: string|null }
-- help() → { tools: [...descriptors...] }
+- memory_context(token: string, limit: int=10) → { recent_commands, items }
+- record_command(command_text: string, tags: string[] = []) → { status | error }
+- commands() → list[{ command_text, tags[], timestamp }]
+- stats() → { total_commands, top_keywords[], active_hours[] }
+- preferences() → {
+    preferred_language,
+    preferred_language_confidence,
+    common_tasks[],
+    style,
+    frameworks[],
+    tools[],
+    signals: { languages, tasks, styles, frameworks, tools }
+  }
+- contextual_preferences(context: string, limit: int=50) → {
+    matched_groups[],
+    preferred_language,
+    style_subset[], tasks_subset[], frameworks_subset[], tools_subset[],
+    signals_overlap: { tasks, styles, tools },
+    context,
+    note? (present when neutral fallback used)
+  }
+- help() → { tools: [...] }
 
 Resource
 - memory://user/{token}/recent → recent context as JSON string (token ignored in single-user mode)
 
 ## Validation Checklist (must pass every time)
-- [ ] Fetched /preferences on the first actionable turn.
-- [ ] Posted every actionable user message to /record_command before replying.
-- [ ] Stored verbatim text with formatting/newlines preserved.
-- [ ] Chose ≤3 meaningful tags or none.
-- [ ] Did not record assistant output.
-- [ ] Allowed duplicates.
+- [ ] Used contextual_preferences() if a clear task was present; else preferences().
+- [ ] Posted EVERY actionable user message to record_command before replying.
+- [ ] Stored verbatim user text (formatting, newlines, emoji intact).
+- [ ] Chose ≤3 accurate tags or none (no guessing).
+- [ ] Never recorded assistant output.
+- [ ] Allowed duplicates (no dedupe).
+- [ ] Re-fetched preferences() after significant shift or ~25 turns.
 
 ## Common Mistakes to Avoid
 - Summarizing before storing → Always store the full raw text.
@@ -68,7 +90,37 @@ Resource
 - Logging assistant messages → Never.
 
 ## Quick Audit
-1) Compare recent user turns to /commands count.
-2) Spot-check multi-line preservation.
-3) Ensure no assistant phrasing appears in stored set.
-4) Verify tag vocabulary stays within the listed sets.
+1) /commands count equals number of actionable user turns.
+2) Multi-line inputs preserved exactly (no collapsed whitespace).
+3) No assistant phrasing appears in stored commands.
+4) Tags strictly in allowed vocabulary or empty.
+5) contextual_preferences used for task-specific steps; preferences baseline not over-called.
+
+## Usage Examples (REST)
+Persist a command:
+```bash
+curl -X POST http://localhost:8000/record_command \
+  -H 'Content-Type: application/json' \
+  -d '{"command_text":"Add unit tests for parser","tags":["test","python"]}'
+```
+Holistic preferences:
+```bash
+curl -s http://localhost:8000/preferences | jq
+```
+Contextual (documentation task):
+```bash
+curl -s -X POST http://localhost:8000/preferences/contextual \
+  -H 'Content-Type: application/json' \
+  -d '{"context":"Update README and improve docs clarity"}' | jq
+```
+
+## Strategy Guidance
+- Call contextual_preferences for each NEW distinct user goal (not every micro-message).
+- Avoid spamming preferences/contextual_preferences; cache within a short interaction window.
+- If signals are sparse (few commands stored), encourage user to proceed; do NOT fabricate preferences.
+
+## Future Extensions (informative, non-binding)
+- Recency weighting (windowed stats)
+- Negation detection ("avoid docker")
+- Confidence thresholds & insufficient_data flag
+- Relevance scoring beyond keyword overlap

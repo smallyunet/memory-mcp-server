@@ -95,6 +95,17 @@ def tool_preferences() -> dict:
     return crud.analyze_preferences()
 
 
+@mcp.tool(name="contextual_preferences")
+def tool_contextual_preferences(context: str, limit: int = 50) -> dict:
+        """Return context-aware subset of preferences for a given task description.
+
+        Inputs:
+            - context: free-form task or instruction text
+            - limit: advisory cap (currently unused but reserved for future recency filtering)
+        """
+        return crud.analyze_preferences_contextual(context=context, limit=limit)
+
+
 @mcp.tool(name="help")
 def tool_help() -> dict:
     """List available tools and their usage signatures for this server."""
@@ -114,6 +125,11 @@ def tool_help() -> dict:
             {"name": "commands", "args": {}, "description": "List all stored commands (newest first)."},
             {"name": "stats", "args": {}, "description": "Basic usage statistics across commands."},
             {"name": "preferences", "args": {}, "description": "Heuristic preference analysis."},
+            {
+                "name": "contextual_preferences",
+                "args": {"context": "string", "limit": "int=50"},
+                "description": "Task-focused preference subset based on provided context string.",
+            },
         ]
     }
 
@@ -170,6 +186,18 @@ async def stats(request):
 @mcp.custom_route("/preferences", methods=["GET"])
 async def preferences(request):
     data = crud.analyze_preferences()
+    return JSONResponse(data)
+
+
+@mcp.custom_route("/preferences/contextual", methods=["POST"])
+async def preferences_contextual(request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+    context = (body or {}).get("context", "")
+    limit = (body or {}).get("limit", 50)
+    data = crud.analyze_preferences_contextual(context=context, limit=limit)
     return JSONResponse(data)
 
 
