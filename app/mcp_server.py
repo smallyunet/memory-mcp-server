@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from mcp.server.fastmcp import FastMCP
 
 import crud
 import database
+from starlette.responses import JSONResponse
 
 # Initialize DB tables
 database.init_db()
@@ -16,10 +17,14 @@ database.init_db()
 mcp = FastMCP(
     "memory-mcp",
     instructions=(
-        "Memory usage policy: 1) At conversation start, on a new task, or roughly every 3–5 turns, call 'memory_context(token, limit=15)' to refresh recent preferences. "
-        "2) When you infer a stable user preference, profile detail, project-wide decision, or reusable fact, call 'memory_record(token, summary, category?, tags?, detail?)'. "
-        "Keep summaries concise (<=160 chars) and avoid secrets or one-time data. 3) For targeted recall, use 'memory_search(token, query)'. "
-        "Avoid calling tools every turn; refresh when it benefits future turns."
+        "Command Memory Layer:"
+        " Use 'record_command(command_text, tags?)' (MCP Tool) to persist raw user instructions."
+        " Use 'memory_context(token, limit?)' (MCP Tool) to retrieve recent user commands for grounding."
+        " Use 'commands()' (MCP Tool) to list all stored commands."
+        " Use 'stats()' (MCP Tool) to get simple usage statistics."
+        " Use 'preferences()' (MCP Tool) to get heuristic preference analysis."
+        " Tip: some clients cache tool lists — disconnect/reconnect to refresh after updates."
+        " Streamable HTTP is also available at /mcp; legacy record/search tools are removed."
     ),
 )
 
@@ -30,85 +35,142 @@ mcp.settings.port = 8000
 mcp.settings.streamable_http_path = "/mcp"
 
 
-# Resources
-@mcp.resource("memory://help")
-def help_resource() -> str:
-    """Public help content describing endpoints and MCP methods."""
-    return (
-        "# Memory MCP\n\n"
-        "Tools:\n\n"
-        "- memory_record(token, summary, category?, tags?, detail?)\n"
-        "- memory_search(token, query)\n"
-        "- memory_context(token, limit?)\n\n"
-        "Resources:\n\n"
-        "- memory://help (this page)\n"
-        "- memory://user/{token}/recent (recent summaries for user token)\n"
-    )
-
-
 @mcp.resource("memory://user/{token}/recent")
 def user_recent_resource(token: str) -> str:
-    """Return recent memory context for a given token as JSON string."""
-    # Default to a slightly larger window for human-readable resource
-    data = crud.get_recent_context(token, limit=10)
+    """Return recent command context as JSON string (token ignored in single-user mode)."""
+    data = crud.get_recent_context(limit=10)
     return json.dumps(data)
 
 
 # Tools
-@mcp.tool(name="memory_record")
-def tool_record(token: str, summary: str, category: str = "general", tags: Optional[List[str]] = None, detail: Optional[dict] = None) -> str:
-    """Store a memory record for a user token."""
-    payload = {
-        "summary": summary,
-        "category": category,
-        "tags": tags or [],
-        "detail": detail,
-    }
-    crud.create_record(token, payload)
-    return "ok"
-
-
-@mcp.tool(name="memory_search")
-def tool_search(token: str, query: str) -> dict:
-    """Search memory records for a user token by query in summary."""
-    results = crud.search_records(token, query)
-    return {"results": results}
+## Removed legacy memory_record and memory_search tools (record feature deprecated)
 
 
 @mcp.tool(name="memory_context")
 def tool_context(token: str, limit: int = 10) -> dict:
-    """Return recent memory context for a user token. Limit is advisory."""
-    context = crud.get_recent_context(token, limit=limit)
+    """Return recent command context (single-user; token is ignored). Limit is advisory."""
+    context = crud.get_recent_context(limit=limit)
     return context
 
 
+# Additional MCP tools mirroring existing HTTP routes
+
+@mcp.tool(name="record_command")
+def tool_record_command(command_text: str, tags: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Save a raw user command (single-user).
+
+    Inputs:
+    - command_text: required instruction text
+    - tags: optional list of tag strings
+
+    Returns: { "status": "ok" } on success, or { "error": str } on validation failure.
+    """
+    if not command_text or not isinstance(command_text, str):
+        return {"error": "command_text_required"}
+    if tags is None:
+        tags = []
+    if not isinstance(tags, list):
+        return {"error": "tags_must_be_list"}
+    # Coerce non-string items to strings defensively
+    safe_tags = [str(t) for t in tags if t is not None]
+    crud.create_command(command_text=command_text, tags=safe_tags)
+    return {"status": "ok"}
+
+
+@mcp.tool(name="commands")
+def tool_list_commands() -> list[dict]:
+    """Return all historical commands for the authenticated user (newest first)."""
+    return crud.list_commands()
+
+
+@mcp.tool(name="stats")
+def tool_stats() -> dict:
+    """Return basic statistics across commands (single-user)."""
+    return crud.compute_stats()
+
+
+@mcp.tool(name="preferences")
+def tool_preferences() -> dict:
+    """Return heuristic preference analysis inferred from commands (single-user)."""
+    return crud.analyze_preferences()
+
+
+@mcp.tool(name="help")
+def tool_help() -> dict:
+    """List available tools and their usage signatures for this server."""
+    # Static descriptor to avoid relying on private internals of FastMCP
+    return {
+        "tools": [
+            {
+                "name": "memory_context",
+                "args": {"token": "string (ignored)", "limit": "int=10"},
+                "description": "Return recent command context (single-user).",
+            },
+            {
+                "name": "record_command",
+                "args": {"command_text": "string", "tags": "list[string]=[]"},
+                "description": "Persist a raw user instruction with optional tags.",
+            },
+            {"name": "commands", "args": {}, "description": "List all stored commands (newest first)."},
+            {"name": "stats", "args": {}, "description": "Basic usage statistics across commands."},
+            {"name": "preferences", "args": {}, "description": "Heuristic preference analysis."},
+        ]
+    }
+
+
 # Optional: Prompts to guide clients/LLMs
-@mcp.prompt(title="Add Memory")
-def prompt_add_memory(summary: str, category: str = "general", tags: str = "") -> str:
-    """Prompt template for adding a memory."""
-    return (
-        "You are a helpful assistant that records user memories.\n"
-        f"Category: {category}\n"
-        f"Tags: {tags}\n"
-        f"Summary: {summary}\n"
-    )
-
-
-@mcp.prompt(title="Search Memory")
-def prompt_search_memory(query: str) -> str:
-    """Prompt template for searching memories."""
-    return (
-        "Search the stored memories for relevant items.\n"
-        f"Query: {query}\n"
-    )
+## Removed legacy prompts related to record storage and search.
 
 
 # Lightweight health endpoint for quick readiness checks
 @mcp.custom_route("/healthz", methods=["GET"])
 async def health_check(request):
-    from starlette.responses import JSONResponse
-
     return JSONResponse({"status": "ok", "transport": "streamable-http", "path": mcp.settings.streamable_http_path})
+
+
+# ------------------------------
+# REST API: Command Memory Layer
+# ------------------------------
+
+@mcp.custom_route("/record_command", methods=["POST"])
+async def record_command(request):
+    """Save a raw user command.
+
+    Body: { "command_text": str, "tags": [str, ...] }
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+
+    command_text = (data or {}).get("command_text")
+    tags = (data or {}).get("tags", []) or []
+    if not command_text or not isinstance(command_text, str):
+        return JSONResponse({"error": "command_text_required"}, status_code=400)
+    if not isinstance(tags, list):
+        return JSONResponse({"error": "tags_must_be_list"}, status_code=400)
+
+    crud.create_command(command_text=command_text, tags=tags)
+    return JSONResponse({"status": "ok"})
+
+
+@mcp.custom_route("/commands", methods=["GET"])
+async def list_commands(request):
+    """Return all historical commands for the authenticated user."""
+    items = crud.list_commands()
+    return JSONResponse(items)
+
+
+@mcp.custom_route("/stats", methods=["GET"])
+async def stats(request):
+    data = crud.compute_stats()
+    return JSONResponse(data)
+
+
+@mcp.custom_route("/preferences", methods=["GET"])
+async def preferences(request):
+    data = crud.analyze_preferences()
+    return JSONResponse(data)
 
 
 if __name__ == "__main__":

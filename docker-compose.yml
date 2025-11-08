@@ -1,4 +1,3 @@
-version: "3.9"
 services:
   memory-mcp:
     build: ./app
@@ -17,6 +16,10 @@ services:
       - memory-mcp
     ports:
       - "8080:8080"
+    # On Apple Silicon (arm64), this image is amd64-only and will run via emulation.
+    # Explicitly set platform to silence warnings. For native arm64, consider
+    # replacing this image with a Python-based container installing sqlite-web via pip.
+    platform: linux/amd64
     # Mount the SQLite database directory read-only for safe viewing
     volumes:
       - ./data:/data

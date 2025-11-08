@@ -1,80 +1,130 @@
 import models, database
 from sqlalchemy.orm import Session
-import json
+from typing import List, Dict
 
-def create_record(user_id: str, data: dict):
-    """Insert a new record into the database."""
-    db: Session = database.SessionLocal()
-    record = models.Record(
-        user_id=user_id,
-        category=data.get("category", "general"),
-        summary=data.get("summary"),
-        detail=json.dumps(data),
-        tags=",".join(data.get("tags", []))
-    )
-    db.add(record)
-    db.commit()
-    db.close()
-
-def search_records(user_id: str, query: str):
-    """Return records that match the query across summary, tags, or category.
-
-    Note: This broadens matching beyond summary to improve recall for
-    technical preferences/decisions that are often captured via tags
-    (e.g., "docker", "postgres") or category (e.g., "technical decision").
-    """
-    from sqlalchemy import or_
-
-    db: Session = database.SessionLocal()
-    q = f"%{query}%"
-    results = (
-        db.query(models.Record)
-        .filter(models.Record.user_id == user_id)
-        .filter(
-            or_(
-                models.Record.summary.ilike(q),
-                models.Record.tags.ilike(q),
-                models.Record.category.ilike(q),
-            )
+def create_command(command_text: str, tags: List[str]):
+    """Insert a raw user command into the commands table (single-user mode)."""
+    with database.session_scope() as db:
+        entry = models.Command(
+            command_text=command_text,
+            tags=",".join(tags) if tags else "",
         )
-        .order_by(models.Record.timestamp.desc())
-        .limit(10)
-        .all()
-    )
-    db.close()
+        db.add(entry)
+
+def list_commands() -> List[Dict]:
+    """Return all commands ordered by newest first (single-user)."""
+    with database.session_scope() as db:
+        rows = (
+            db.query(models.Command)
+            .order_by(models.Command.timestamp.desc())
+            .all()
+        )
     return [
         {
-            "summary": r.summary,
-            "category": r.category,
-            "tags": r.tags,
-            "timestamp": r.timestamp.isoformat(),
+            "command_text": r.command_text,
+            "tags": r.tags.split(",") if r.tags else [],
+            "timestamp": r.timestamp.isoformat() + "Z",
         }
-        for r in results
+        for r in rows
     ]
 
-def get_recent_context(user_id: str, limit: int = 5):
-    """Return the most recent user records up to the given limit.
+def compute_stats() -> Dict:
+    """Compute basic statistics across commands (single-user)."""
+    with database.session_scope() as db:
+        rows = db.query(models.Command).all()
+    total = len(rows)
+    tag_counter: Dict[str, int] = {}
+    hour_counter: Dict[int, int] = {}
+    for r in rows:
+        # tags
+        for t in (r.tags.split(",") if r.tags else []):
+            if not t:
+                continue
+            tag_counter[t] = tag_counter.get(t, 0) + 1
+        # active hours (UTC hour bucket)
+        hour = r.timestamp.hour
+        hour_counter[hour] = hour_counter.get(hour, 0) + 1
 
-    Returns both a list of summaries and an 'items' array with richer metadata
-    to support clients that need categories/tags without additional queries.
-    """
-    db: Session = database.SessionLocal()
-    recents = (
-        db.query(models.Record)
-        .filter(models.Record.user_id == user_id)
-        .order_by(models.Record.timestamp.desc())
-        .limit(limit)
-        .all()
-    )
-    db.close()
+    # top keywords derived from tags for MVP (could expand to NLP of command_text later)
+    top_keywords = sorted(tag_counter.items(), key=lambda x: x[1], reverse=True)[:5]
+    # Convert active hours into simple ranges (coarse heuristic)
+    active_hours_sorted = sorted(hour_counter.items(), key=lambda x: x[1], reverse=True)[:3]
+    # Format hours: e.g., 10 -> "10:00-11:00"
+    active_hour_ranges = [f"{h:02d}:00-{(h+1)%24:02d}:00" for h, _ in active_hours_sorted]
+
     return {
-        "recent_summaries": [r.summary for r in recents],
+        "total_commands": total,
+        "top_keywords": [k for k, _ in top_keywords],
+        "active_hours": active_hour_ranges,
+    }
+
+def analyze_preferences() -> Dict:
+    """Heuristic preference analysis from commands.
+
+    - preferred_language: inferred from tags (python, js, go, java, rust etc.)
+    - common_tasks: tags like test, refactor, optimize
+    - style: look for substrings in command_text (async, clean, OOP, functional)
+    """
+    with database.session_scope() as db:
+        rows = db.query(models.Command).all()
+
+    # Language inference
+    lang_tags_priority = ["python", "typescript", "javascript", "go", "java", "rust"]
+    tag_counts: Dict[str, int] = {}
+    common_task_markers = ["refactor", "test", "optimize", "document", "deploy"]
+    task_counts: Dict[str, int] = {}
+    style_markers = ["async", "clean", "performance", "OOP", "functional"]
+    style_hits: List[str] = []
+
+    for r in rows:
+        tags = r.tags.split(",") if r.tags else []
+        for t in tags:
+            if not t:
+                continue
+            tag_counts[t] = tag_counts.get(t, 0) + 1
+        lower = r.command_text.lower() if r.command_text else ""
+        for marker in common_task_markers:
+            if marker in lower:
+                task_counts[marker] = task_counts.get(marker, 0) + 1
+        for style in style_markers:
+            if style.lower() in lower:
+                style_hits.append(style)
+
+    preferred_language = None
+    for lang in lang_tags_priority:
+        if lang in tag_counts:
+            preferred_language = lang.capitalize() if lang == "python" else lang
+            break
+
+    common_tasks = [k.replace("document", "documentation") for k, _ in sorted(task_counts.items(), key=lambda x: x[1], reverse=True)[:5]]
+    style_summary = ", ".join(sorted(set(style_hits))) if style_hits else None
+
+    return {
+        "preferred_language": preferred_language,
+        "common_tasks": common_tasks,
+        "style": style_summary,
+    }
+
+def get_recent_context(limit: int = 5):
+    """Return the most recent user commands up to the given limit.
+
+    Provides a simplified context of recent raw instructions (command_text)
+    and associated tags. This replaces previous record-based context.
+    """
+    with database.session_scope() as db:
+        recents = (
+            db.query(models.Command)
+            .order_by(models.Command.timestamp.desc())
+            .limit(limit)
+            .all()
+        )
+    return {
+        "recent_commands": [r.command_text for r in recents],
         "items": [
             {
-                "summary": r.summary,
-                "category": r.category,
-                "tags": r.tags,
-                "timestamp": r.timestamp.isoformat(),
+                "command_text": r.command_text,
+                "tags": r.tags.split(",") if r.tags else [],
+                "timestamp": r.timestamp.isoformat() + "Z",
             }
             for r in recents
         ],

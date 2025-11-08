@@ -1,2 +1,6 @@
-mcp
-SQLAlchemy
+# Pinned runtime dependencies for reproducible builds
+# Note: If the MCP package version is unavailable in your registry, adjust accordingly.
+mcp==1.21.0
+SQLAlchemy==2.0.36
+fastapi==0.115.2
+uvicorn==0.31.1
