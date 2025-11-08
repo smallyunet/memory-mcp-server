@@ -6,7 +6,16 @@ from contextlib import contextmanager
 SQLALCHEMY_DATABASE_URL = "sqlite:///./data/memory.db"
 
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+# Important: prevent attribute expiration on commit so ORM instances remain usable
+# after the session is closed (we serialize them outside the session context).
+# Without this, accessing attributes may trigger a refresh on a closed session,
+# causing "Instance is not bound to a Session" errors.
+SessionLocal = sessionmaker(
+    bind=engine,
+    autocommit=False,
+    autoflush=False,
+    expire_on_commit=False,
+)
 Base = declarative_base()
 
 def init_db():

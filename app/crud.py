@@ -11,31 +11,43 @@ def create_command(command_text: str, tags: List[str]):
         )
         db.add(entry)
 
+def _serialize_commands(rows: List[models.Command]) -> List[Dict]:
+    """Convert ORM rows to plain serializable dicts without relying on lazy loads."""
+    serialized = []
+    for r in rows:
+        serialized.append({
+            "command_text": r.command_text,
+            "tags": r.tags.split(",") if r.tags else [],
+            "timestamp": r.timestamp.isoformat() + "Z",
+        })
+    return serialized
+
+
 def list_commands() -> List[Dict]:
-    """Return all commands ordered by newest first (single-user)."""
+    """Return all commands ordered by newest first (single-user).
+
+    Note: We immediately serialize inside the session context so that no
+    attribute access is attempted after the session is closed, avoiding
+    detached instance refresh errors.
+    """
     with database.session_scope() as db:
         rows = (
             db.query(models.Command)
             .order_by(models.Command.timestamp.desc())
             .all()
         )
-    return [
-        {
-            "command_text": r.command_text,
-            "tags": r.tags.split(",") if r.tags else [],
-            "timestamp": r.timestamp.isoformat() + "Z",
-        }
-        for r in rows
-    ]
+        return _serialize_commands(rows)
 
 def compute_stats() -> Dict:
     """Compute basic statistics across commands (single-user)."""
     with database.session_scope() as db:
         rows = db.query(models.Command).all()
-    total = len(rows)
+        # Work with a fully serialized snapshot to avoid detached issues.
+        snap = list(rows)
+    total = len(snap)
     tag_counter: Dict[str, int] = {}
     hour_counter: Dict[int, int] = {}
-    for r in rows:
+    for r in snap:
         # tags
         for t in (r.tags.split(",") if r.tags else []):
             if not t:
@@ -67,6 +79,7 @@ def analyze_preferences() -> Dict:
     """
     with database.session_scope() as db:
         rows = db.query(models.Command).all()
+        snap = list(rows)  # snapshot before session closes
 
     # Language inference
     lang_tags_priority = ["python", "typescript", "javascript", "go", "java", "rust"]
@@ -76,7 +89,7 @@ def analyze_preferences() -> Dict:
     style_markers = ["async", "clean", "performance", "OOP", "functional"]
     style_hits: List[str] = []
 
-    for r in rows:
+    for r in snap:
         tags = r.tags.split(",") if r.tags else []
         for t in tags:
             if not t:
@@ -109,7 +122,7 @@ def get_recent_context(limit: int = 5):
     """Return the most recent user commands up to the given limit.
 
     Provides a simplified context of recent raw instructions (command_text)
-    and associated tags. This replaces previous record-based context.
+    and associated tags. We serialize while the session is active.
     """
     with database.session_scope() as db:
         recents = (
@@ -118,14 +131,15 @@ def get_recent_context(limit: int = 5):
             .limit(limit)
             .all()
         )
-    return {
-        "recent_commands": [r.command_text for r in recents],
-        "items": [
+        items = [
             {
                 "command_text": r.command_text,
                 "tags": r.tags.split(",") if r.tags else [],
                 "timestamp": r.timestamp.isoformat() + "Z",
             }
             for r in recents
-        ],
-    }
+        ]
+        return {
+            "recent_commands": [i["command_text"] for i in items],
+            "items": items,
+        }
